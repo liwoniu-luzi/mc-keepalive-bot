@@ -1,0 +1,12 @@
+{
+  "name": "mc-keepalive-bot",
+  "version": "1.0.0",
+  "description": "7x24 Minecraft Keep-Alive Bot for Unikraft and Local",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.20.1"
+  }
+}

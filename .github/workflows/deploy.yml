@@ -1,0 +1,33 @@
+name: Deploy MC KeepAlive Bot to Unikraft Cloud
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install KraftKit CLI
+        run: |
+          curl -sSfL https://get.kraftkit.sh | sudo sh
+
+      - name: Deploy to Unikraft Cloud (Singapore metro)
+        env:
+          KRAFTCLOUD_TOKEN: ${{ secrets.KRAFTCLOUD_TOKEN }}
+          KRAFTCLOUD_METRO: sin
+        run: |
+          kraft cloud deploy \
+            --name mc-keepalive-bot \
+            --metro sin \
+            --memory 128 \
+            --scale-to-zero=false \
+            --env MC_HOST="144.31.46.15" \
+            --env MC_PORT="10486" \
+            --env PORT="8080" \
+            --port 8080:8080 \
+            .
