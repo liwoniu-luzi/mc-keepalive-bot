@@ -12,16 +12,17 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install KraftKit CLI
-        run: |
-          curl -sSfL https://get.kraftkit.sh | sudo sh
+      - name: Setup Unikraft CLI
+        uses: unikraft/setup-action@v1
+        with:
+          token: ${{ secrets.KRAFTCLOUD_TOKEN }}
 
       - name: Deploy to Unikraft Cloud (Singapore metro)
         env:
+          UKC_TOKEN: ${{ secrets.KRAFTCLOUD_TOKEN }}
           KRAFTCLOUD_TOKEN: ${{ secrets.KRAFTCLOUD_TOKEN }}
-          KRAFTCLOUD_METRO: sin
         run: |
-          kraft cloud deploy \
+          unikraft deploy \
             --name mc-keepalive-bot \
             --metro sin \
             --memory 128 \
@@ -29,5 +30,5 @@ jobs:
             --env MC_HOST="144.31.46.15" \
             --env MC_PORT="10486" \
             --env PORT="8080" \
-            --port 8080:8080 \
+            -p 8080:8080 \
             .
