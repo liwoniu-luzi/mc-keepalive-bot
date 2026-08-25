@@ -17,18 +17,22 @@ jobs:
         with:
           token: ${{ secrets.KRAFTCLOUD_TOKEN }}
 
-      - name: Deploy to Unikraft Cloud (Singapore metro)
-        env:
-          UKC_TOKEN: ${{ secrets.KRAFTCLOUD_TOKEN }}
-          KRAFTCLOUD_TOKEN: ${{ secrets.KRAFTCLOUD_TOKEN }}
+      - name: Build Unikernel Image
         run: |
-          unikraft deploy \
-            --name mc-keepalive-bot \
-            --metro sin \
-            --memory 128 \
-            --scale-to-zero=false \
-            --env MC_HOST="144.31.46.15" \
-            --env MC_PORT="10486" \
-            --env PORT="8080" \
+          unikraft build . --output yili/mc-keepalive-bot:latest
+
+      - name: Deploy to Unikraft Cloud (Singapore metro)
+        run: |
+          # If instance exists, remove it first to recreate with new image
+          unikraft --metro=sin instances delete mc-keepalive-bot || true
+          
+          # Run instance常驻无休眠
+          unikraft run \
+            --metro=sin \
+            --name=mc-keepalive-bot \
+            --memory=128MiB \
+            -e MC_HOST="144.31.46.15" \
+            -e MC_PORT="10486" \
+            -e PORT="8080" \
             -p 8080:8080 \
-            .
+            --image=yili/mc-keepalive-bot:latest
