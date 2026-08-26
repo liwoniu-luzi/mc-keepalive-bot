@@ -1,14 +1,17 @@
-FROM node:20-alpine
+FROM golang:1.22-bookworm AS build
 
-WORKDIR /app
+WORKDIR /src
+COPY main.go /src/main.go
 
-COPY package*.json ./
+RUN set -xe; \
+    go build \
+      -buildmode=pie \
+      -ldflags "-linkmode external -extldflags -static-pie -s -w" \
+      -tags netgo \
+      -o /app \
+      main.go
 
-RUN npm install --omit=dev --no-audit --no-fund && \
-    find ./node_modules/minecraft-data/minecraft-data/data/pc -mindepth 1 -maxdepth 1 ! -name '1.21.4' ! -name 'common' -exec rm -rf {} + 2>/dev/null || true
-
-COPY bot.js ./
-
+FROM scratch
+COPY --from=build /app /app
 EXPOSE 8080
-
-CMD ["node", "bot.js"]
+ENTRYPOINT ["/app"]
