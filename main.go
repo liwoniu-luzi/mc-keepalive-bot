@@ -43,7 +43,6 @@ func getEnvInt(key string, def int) int {
 	return def
 }
 
-// VarInt encode
 func writeVarInt(w io.Writer, value int) {
 	for {
 		if (value & ^0x7F) == 0 {
@@ -55,13 +54,35 @@ func writeVarInt(w io.Writer, value int) {
 	}
 }
 
+func readVarInt(r io.Reader) (int, error) {
+	var value int
+	var position uint
+	buf := make([]byte, 1)
+
+	for {
+		_, err := io.ReadFull(r, buf)
+		if err != nil {
+			return 0, err
+		}
+		b := buf[0]
+		value |= int(b&0x7F) << position
+		if (b & 0x80) == 0 {
+			break
+		}
+		position += 7
+		if position >= 32 {
+			return 0, fmt.Errorf("VarInt is too big")
+		}
+	}
+	return value, nil
+}
+
 func writeString(w io.Writer, s string) {
 	b := []byte(s)
 	writeVarInt(w, len(b))
 	w.Write(b)
 }
 
-// 创建普通未启用压缩的数据包 (Handshake / Login Start)
 func createUncompressedPacket(packetID int, payload []byte) []byte {
 	var body bytes.Buffer
 	writeVarInt(&body, packetID)
@@ -73,10 +94,9 @@ func createUncompressedPacket(packetID int, payload []byte) []byte {
 	return packet.Bytes()
 }
 
-// 创建开启压缩后的数据包 (带有 DataLength=0 标识头，解决 Netty threshold 报错)
 func createCompressedPacket(packetID int, payload []byte) []byte {
 	var body bytes.Buffer
-	writeVarInt(&body, 0) // Data Length = 0 表示本数据包未超过 threshold，直接按未压缩数据传输
+	writeVarInt(&body, 0) // Data length = 0 (uncompressed payload)
 	writeVarInt(&body, packetID)
 	body.Write(payload)
 
@@ -101,15 +121,15 @@ func runEntityKeepAliveClient() {
 			continue
 		}
 
-		// 1. Handshake to Login State (Protocol 776, Next State: 2 Login) - 未压缩状态
+		// 1. Handshake (Protocol 776, Next State: 2 Login)
 		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 776) // Protocol 776 (MC 26.2)
+		writeVarInt(&hsPayload, 776) // Protocol 776
 		writeString(&hsPayload, mcHost)
 		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
 		writeVarInt(&hsPayload, 2) // Next State: 2 (Login)
 		conn.Write(createUncompressedPacket(0x00, hsPayload.Bytes()))
 
-		// 2. Login Start Packet - 未压缩状态
+		// 2. Login Start Packet
 		var loginStart bytes.Buffer
 		writeString(&loginStart, mcUser)
 		playerUUID := make([]byte, 16)
@@ -125,51 +145,113 @@ func runEntityKeepAliveClient() {
 		probesSent++
 		mu.Unlock()
 
-		// 3. 在收到服务端 Set Compression 后，后续所有的 Ack 和 KeepAlive 包均使用带 DataLength=0 的规范格式
-		ticker := time.NewTicker(10 * time.Second)
-		stopHeartbeat := make(chan struct{})
+		// 3. 响应式事件循环：根据服务端下发的数据包精准回复
+		state := "login" // login -> config -> play
+		compressionEnabled := false
 
-		go func() {
-			// 先立即回复一个带压缩头的 Login Acknowledged / Configuration Ack
-			time.Sleep(500 * time.Millisecond)
-			conn.Write(createCompressedPacket(0x03, nil))
-
-			for {
-				select {
-				case <-ticker.C:
-					// 持续在长连接通道中发送规范的 Keep-Alive 心跳包
-					conn.Write(createCompressedPacket(0x03, nil))
-					mu.Lock()
-					lastPingTime = time.Now().UTC().Format(time.RFC3339)
-					probesSent++
-					mu.Unlock()
-				case <-stopHeartbeat:
-					return
-				}
-			}
-		}()
-
-		// 4. 读取服务器数据流，维持连接
-		buffer := make([]byte, 4096)
 		for {
-			conn.SetDeadline(time.Now().Add(35 * time.Second))
-			n, err := conn.Read(buffer)
+			conn.SetDeadline(time.Now().Add(45 * time.Second))
+
+			// Read packet length
+			pktLen, err := readVarInt(conn)
 			if err != nil {
 				log.Printf("[-] Server disconnected: %v", err)
 				break
 			}
-			if n > 0 {
-				mu.Lock()
-				lastPingTime = time.Now().UTC().Format(time.RFC3339)
-				probesSent++
-				mu.Unlock()
+
+			if pktLen <= 0 {
+				continue
+			}
+
+			pktData := make([]byte, pktLen)
+			_, err = io.ReadFull(conn, pktData)
+			if err != nil {
+				log.Printf("[-] Failed to read packet payload: %v", err)
+				break
+			}
+
+			pktReader := bytes.NewReader(pktData)
+
+			var packetID int
+			var payload []byte
+
+			if compressionEnabled {
+				dataLen, err := readVarInt(pktReader)
+				if err != nil {
+					continue
+				}
+				if dataLen == 0 {
+					// Uncompressed packet
+					packetID, _ = readVarInt(pktReader)
+					payload, _ = io.ReadAll(pktReader)
+				} else {
+					// Compressed packet - ignore complex decomp for small control packets
+					packetID, _ = readVarInt(pktReader)
+					payload, _ = io.ReadAll(pktReader)
+				}
+			} else {
+				packetID, _ = readVarInt(pktReader)
+				payload, _ = io.ReadAll(pktReader)
+			}
+
+			mu.Lock()
+			lastPingTime = time.Now().UTC().Format(time.RFC3339)
+			probesSent++
+			mu.Unlock()
+
+			// 状态机处理
+			if state == "login" {
+				if packetID == 0x03 { // Set Compression
+					compressionEnabled = true
+					log.Printf("[+] Server enabled compression threshold")
+				} else if packetID == 0x02 { // Login Success
+					state = "config"
+					log.Printf("[+] Login Success! Switched to Configuration state. Sending Login Acknowledged...")
+					if compressionEnabled {
+						conn.Write(createCompressedPacket(0x03, nil)) // Login Acknowledged
+					} else {
+						conn.Write(createUncompressedPacket(0x03, nil))
+					}
+				}
+			} else if state == "config" {
+				// 在 Configuration 状态中处理服务器交互
+				if packetID == 0x00 { // Client Information Request or Cookie
+					// Send Client Information (locale: "en_US", viewDistance: 2, chatMode: 0, chatColors: true, displayedSkin: 127)
+					var ci bytes.Buffer
+					writeString(&ci, "en_US")
+					ci.WriteByte(2)    // View distance
+					writeVarInt(&ci, 0) // Chat mode
+					ci.WriteByte(1)    // Chat colors
+					ci.WriteByte(127)  // Skin parts
+					writeVarInt(&ci, 0) // Main hand: Left (0) / Right (1)
+					ci.WriteByte(0)    // Text filtering
+					ci.WriteByte(1)    // Server listing
+
+					conn.Write(createCompressedPacket(0x00, ci.Bytes()))
+					log.Printf("[+] Sent Client Information in Configuration state")
+				} else if packetID == 0x07 { // Known Packs
+					// Reply empty known packs
+					var kp bytes.Buffer
+					writeVarInt(&kp, 0) // 0 known packs
+					conn.Write(createCompressedPacket(0x07, kp.Bytes()))
+				} else if packetID == 0x03 { // Finish Configuration from server
+					log.Printf("[+] Received Finish Configuration from server. Sending Acknowledged...")
+					conn.Write(createCompressedPacket(0x03, nil)) // Finish Configuration Acknowledged
+					state = "play"
+					log.Printf("🎉 [SUCCESS] '%s' officially entered PLAY state! Fully spawned into world!", mcUser)
+				} else if packetID == 0x04 { // Ping / Keep Alive
+					// 原样回复 Pong / Keep Alive Response
+					conn.Write(createCompressedPacket(0x04, payload))
+				}
+			} else if state == "play" {
+				// Play 状态中：响应 Keep-Alive (Play KeepAlive ID is usually 0x24 or payload echo)
+				if packetID == 0x24 || len(payload) == 8 {
+					conn.Write(createCompressedPacket(packetID, payload))
+				}
 			}
 		}
 
-		close(stopHeartbeat)
-		ticker.Stop()
 		conn.Close()
-
 		mu.Lock()
 		isEntityOnline = false
 		mu.Unlock()
