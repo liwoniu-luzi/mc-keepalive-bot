@@ -9,4 +9,4 @@ rootfs:
   source: ./Dockerfile
   format: erofs
 
-cmd: ["/app"]
+cmd: ["node", "/app/bot.js"]
