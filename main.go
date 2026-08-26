@@ -123,7 +123,7 @@ func runEntityKeepAliveClient() {
 
 		// 1. Handshake (Protocol 769 for MC 1.21.4, Next State: 2 Login)
 		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 769) // Protocol 769 (MC 1.21.4)
+		writeVarInt(&hsPayload, 769) // Protocol 769
 		writeString(&hsPayload, mcHost)
 		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
 		writeVarInt(&hsPayload, 2) // Next State: 2 (Login)
@@ -138,12 +138,6 @@ func runEntityKeepAliveClient() {
 		conn.Write(createUncompressedPacket(0x00, loginStart.Bytes()))
 
 		log.Printf("[+] Sent Handshake (769 / 1.21.4) + Login Start for '%s'", mcUser)
-
-		mu.Lock()
-		isEntityOnline = true
-		lastPingTime = time.Now().UTC().Format(time.RFC3339)
-		probesSent++
-		mu.Unlock()
 
 		state := "login"
 		compressionEnabled := false
@@ -230,13 +224,25 @@ func runEntityKeepAliveClient() {
 					log.Printf("[+] Received Finish Configuration from server. Sending Acknowledged...")
 					conn.Write(createCompressedPacket(0x03, nil))
 					state = "play"
+					mu.Lock()
+					isEntityOnline = true
+					mu.Unlock()
 					log.Printf("🎉 [SUCCESS] '%s' officially entered PLAY state! Fully spawned into world!", mcUser)
 				} else if packetID == 0x04 { // Ping / Keep Alive
 					conn.Write(createCompressedPacket(0x04, payload))
 				}
 			} else if state == "play" {
-				if packetID == 0x24 || len(payload) == 8 {
-					conn.Write(createCompressedPacket(packetID, payload))
+				// Play 状态处理：
+				// 如果收到 Synchronize Player Position (0x40)，回复 Teleport Confirm (0x00)
+				// 如果收到 Keep Alive (0x26)，回复 Keep Alive Response (0x18)
+				if packetID == 0x40 || packetID == 0x3E {
+					// Extract teleport ID (VarInt at end of packet payload) or reply 0
+					var tc bytes.Buffer
+					writeVarInt(&tc, 0)
+					conn.Write(createCompressedPacket(0x00, tc.Bytes())) // Teleport Confirm
+				} else if packetID == 0x26 || len(payload) == 8 {
+					// Keep Alive
+					conn.Write(createCompressedPacket(0x18, payload))
 				}
 			}
 		}
