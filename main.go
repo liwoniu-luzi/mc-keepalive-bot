@@ -43,7 +43,6 @@ func getEnvInt(key string, def int) int {
 	return def
 }
 
-// VarInt encode
 func writeVarInt(w io.Writer, value int) {
 	for {
 		if (value & ^0x7F) == 0 {
@@ -72,15 +71,14 @@ func createPacket(packetID int, payload []byte) []byte {
 	return packet.Bytes()
 }
 
-// 维持真实实体长连接登录
 func runEntityKeepAliveClient() {
 	for {
 		target := fmt.Sprintf("%s:%d", mcHost, mcPort)
 		log.Printf("[+] Connecting to Minecraft server as '%s' (Target: %s)...", mcUser, target)
 
-		conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+		conn, err := net.DialTimeout("tcp", target, 8*time.Second)
 		if err != nil {
-			log.Printf("[-] TCP connect error: %v. Reconnecting in 10s...", err)
+			log.Printf("[-] TCP connect error: %v. Retrying in 10s...", err)
 			mu.Lock()
 			isEntityOnline = false
 			mu.Unlock()
@@ -88,15 +86,15 @@ func runEntityKeepAliveClient() {
 			continue
 		}
 
-		// 1. Send Handshake (Protocol 776, Next State: 2 Login)
+		// 1. Handshake to Login State (Protocol 776, Next State: 2 Login)
 		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 776) // Protocol 776 (MC 26.2 / Snapshot)
+		writeVarInt(&hsPayload, 776) // Protocol 776 (MC 26.2)
 		writeString(&hsPayload, mcHost)
 		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
-		writeVarInt(&hsPayload, 2) // Next state: 2 (Login)
+		writeVarInt(&hsPayload, 2) // Next State: 2 (Login)
 		conn.Write(createPacket(0x00, hsPayload.Bytes()))
 
-		// 2. Send Login Start
+		// 2. Login Start Packet
 		var loginStart bytes.Buffer
 		writeString(&loginStart, mcUser)
 		playerUUID := make([]byte, 16)
@@ -104,7 +102,7 @@ func runEntityKeepAliveClient() {
 		loginStart.Write(playerUUID)
 		conn.Write(createPacket(0x00, loginStart.Bytes()))
 
-		log.Printf("[+] Sent Login Start for '%s'. Waiting for server response...", mcUser)
+		log.Printf("[+] Sent Handshake (776) + Login Start for '%s'", mcUser)
 
 		mu.Lock()
 		isEntityOnline = true
@@ -112,17 +110,36 @@ func runEntityKeepAliveClient() {
 		probesSent++
 		mu.Unlock()
 
-		// 3. Keep-Alive Read/Response Loop
+		// Periodic Keep-Alive heartbeat on same persistent connection
+		ticker := time.NewTicker(10 * time.Second)
+		stopHeartbeat := make(chan struct{})
+
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					// Send Login Acknowledged / Finish Config / Keep-Alive Response
+					ackPacket := createPacket(0x03, nil)
+					conn.Write(ackPacket)
+					mu.Lock()
+					lastPingTime = time.Now().UTC().Format(time.RFC3339)
+					probesSent++
+					mu.Unlock()
+				case <-stopHeartbeat:
+					return
+				}
+			}
+		}()
+
+		// Read Loop to keep TCP connection active and handle server responses
 		buffer := make([]byte, 4096)
 		for {
-			conn.SetDeadline(time.Now().Add(45 * time.Second))
+			conn.SetDeadline(time.Now().Add(35 * time.Second))
 			n, err := conn.Read(buffer)
 			if err != nil {
-				log.Printf("[-] Server connection ended: %v", err)
+				log.Printf("[-] Server disconnected: %v", err)
 				break
 			}
-
-			// If server sends keep-alive or finish configuration, respond back to maintain active link
 			if n > 0 {
 				mu.Lock()
 				lastPingTime = time.Now().UTC().Format(time.RFC3339)
@@ -131,12 +148,15 @@ func runEntityKeepAliveClient() {
 			}
 		}
 
+		close(stopHeartbeat)
+		ticker.Stop()
 		conn.Close()
+
 		mu.Lock()
 		isEntityOnline = false
 		mu.Unlock()
 
-		log.Printf("[!] Disconnected from server. Reconnecting in 10 seconds...")
+		log.Printf("[!] Connection closed. Reconnecting in 10 seconds...")
 		time.Sleep(10 * time.Second)
 	}
 }
@@ -151,7 +171,6 @@ func main() {
 
 	go runEntityKeepAliveClient()
 
-	// HTTP Probe Server
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		mu.Lock()
