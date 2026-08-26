@@ -109,7 +109,7 @@ func createCompressedPacket(packetID int, payload []byte) []byte {
 func runEntityKeepAliveClient() {
 	for {
 		target := fmt.Sprintf("%s:%d", mcHost, mcPort)
-		log.Printf("[+] Connecting to Minecraft server as '%s' (Target: %s)...", mcUser, target)
+		log.Printf("[+] Connecting to Minecraft 1.21.4 server as '%s' (Target: %s)...", mcUser, target)
 
 		conn, err := net.DialTimeout("tcp", target, 8*time.Second)
 		if err != nil {
@@ -121,9 +121,9 @@ func runEntityKeepAliveClient() {
 			continue
 		}
 
-		// 1. Handshake (Protocol 776, Next State: 2 Login)
+		// 1. Handshake (Protocol 769 for MC 1.21.4, Next State: 2 Login)
 		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 776) // Protocol 776
+		writeVarInt(&hsPayload, 769) // Protocol 769 (MC 1.21.4)
 		writeString(&hsPayload, mcHost)
 		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
 		writeVarInt(&hsPayload, 2) // Next State: 2 (Login)
@@ -137,7 +137,7 @@ func runEntityKeepAliveClient() {
 		loginStart.Write(playerUUID)
 		conn.Write(createUncompressedPacket(0x00, loginStart.Bytes()))
 
-		log.Printf("[+] Sent Handshake (776) + Login Start for '%s'", mcUser)
+		log.Printf("[+] Sent Handshake (769 / 1.21.4) + Login Start for '%s'", mcUser)
 
 		mu.Lock()
 		isEntityOnline = true
@@ -145,14 +145,12 @@ func runEntityKeepAliveClient() {
 		probesSent++
 		mu.Unlock()
 
-		// 3. 响应式事件循环：根据服务端下发的数据包精准回复
-		state := "login" // login -> config -> play
+		state := "login"
 		compressionEnabled := false
 
 		for {
 			conn.SetDeadline(time.Now().Add(45 * time.Second))
 
-			// Read packet length
 			pktLen, err := readVarInt(conn)
 			if err != nil {
 				log.Printf("[-] Server disconnected: %v", err)
@@ -181,11 +179,9 @@ func runEntityKeepAliveClient() {
 					continue
 				}
 				if dataLen == 0 {
-					// Uncompressed packet
 					packetID, _ = readVarInt(pktReader)
 					payload, _ = io.ReadAll(pktReader)
 				} else {
-					// Compressed packet - ignore complex decomp for small control packets
 					packetID, _ = readVarInt(pktReader)
 					payload, _ = io.ReadAll(pktReader)
 				}
@@ -199,7 +195,6 @@ func runEntityKeepAliveClient() {
 			probesSent++
 			mu.Unlock()
 
-			// 状态机处理
 			if state == "login" {
 				if packetID == 0x03 { // Set Compression
 					compressionEnabled = true
@@ -208,43 +203,38 @@ func runEntityKeepAliveClient() {
 					state = "config"
 					log.Printf("[+] Login Success! Switched to Configuration state. Sending Login Acknowledged...")
 					if compressionEnabled {
-						conn.Write(createCompressedPacket(0x03, nil)) // Login Acknowledged
+						conn.Write(createCompressedPacket(0x03, nil))
 					} else {
 						conn.Write(createUncompressedPacket(0x03, nil))
 					}
 				}
 			} else if state == "config" {
-				// 在 Configuration 状态中处理服务器交互
-				if packetID == 0x00 { // Client Information Request or Cookie
-					// Send Client Information (locale: "en_US", viewDistance: 2, chatMode: 0, chatColors: true, displayedSkin: 127)
+				if packetID == 0x00 { // Client Information
 					var ci bytes.Buffer
 					writeString(&ci, "en_US")
 					ci.WriteByte(2)    // View distance
 					writeVarInt(&ci, 0) // Chat mode
 					ci.WriteByte(1)    // Chat colors
 					ci.WriteByte(127)  // Skin parts
-					writeVarInt(&ci, 0) // Main hand: Left (0) / Right (1)
+					writeVarInt(&ci, 0) // Main hand
 					ci.WriteByte(0)    // Text filtering
 					ci.WriteByte(1)    // Server listing
 
 					conn.Write(createCompressedPacket(0x00, ci.Bytes()))
 					log.Printf("[+] Sent Client Information in Configuration state")
 				} else if packetID == 0x07 { // Known Packs
-					// Reply empty known packs
 					var kp bytes.Buffer
-					writeVarInt(&kp, 0) // 0 known packs
+					writeVarInt(&kp, 0)
 					conn.Write(createCompressedPacket(0x07, kp.Bytes()))
-				} else if packetID == 0x03 { // Finish Configuration from server
+				} else if packetID == 0x03 { // Finish Configuration
 					log.Printf("[+] Received Finish Configuration from server. Sending Acknowledged...")
-					conn.Write(createCompressedPacket(0x03, nil)) // Finish Configuration Acknowledged
+					conn.Write(createCompressedPacket(0x03, nil))
 					state = "play"
 					log.Printf("🎉 [SUCCESS] '%s' officially entered PLAY state! Fully spawned into world!", mcUser)
 				} else if packetID == 0x04 { // Ping / Keep Alive
-					// 原样回复 Pong / Keep Alive Response
 					conn.Write(createCompressedPacket(0x04, payload))
 				}
 			} else if state == "play" {
-				// Play 状态中：响应 Keep-Alive (Play KeepAlive ID is usually 0x24 or payload echo)
 				if packetID == 0x24 || len(payload) == 8 {
 					conn.Write(createCompressedPacket(packetID, payload))
 				}
@@ -263,7 +253,7 @@ func runEntityKeepAliveClient() {
 
 func main() {
 	log.Printf("=======================================================")
-	log.Printf("🚀 Ultra-Light Minecraft 7x24 Entity Bot on Unikraft")
+	log.Printf("🚀 Ultra-Light Minecraft 1.21.4 Entity Bot on Unikraft")
 	log.Printf("🎯 Target  : %s:%d", mcHost, mcPort)
 	log.Printf("👤 Player  : %s", mcUser)
 	log.Printf("🌐 HTTP    : 0.0.0.0:%s", httpPort)
