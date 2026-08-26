@@ -1,11 +1,11 @@
 FROM golang:1.22-bookworm AS build
 
 WORKDIR /src
-COPY main.go /src/main.go
+COPY go.mod ./
+COPY main.go ./
 
 RUN set -xe; \
-    go mod init mc-keepalive-bot && \
-    go get github.com/Tnze/go-mc@master && \
+    go mod tidy && \
     go build \
       -buildmode=pie \
       -ldflags "-linkmode external -extldflags -static-pie -s -w" \
