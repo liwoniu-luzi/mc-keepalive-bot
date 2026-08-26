@@ -1,153 +1,80 @@
-const net = require('net');
-const http = require('http');
 const mineflayer = require('mineflayer');
+const http = require('http');
 
 const MC_HOST = process.env.MC_HOST || '144.31.46.15';
 const MC_PORT = parseInt(process.env.MC_PORT || '10486', 10);
 const MC_USER = process.env.MC_USER || 'KeepAliveBot';
-const MC_VERSION = process.env.MC_VERSION || '1.21.4';
 const HTTP_PORT = parseInt(process.env.PORT || '8080', 10);
 
-let tcpActiveCount = 0;
-let lastPingTime = null;
-let lastServerStatus = 'unknown';
+let bot = null;
+let isSpawned = false;
+let lastSpawnTime = null;
+let totalReconnections = 0;
 
-// 1. Raw Minecraft TCP Keep-Alive & Handshake Stream (Works on ANY Minecraft version including 26.2 snapshot)
-function startTcpKeepAliveStream() {
-  function sendPing() {
-    const socket = new net.Socket();
-    socket.setTimeout(8000);
+function startBot() {
+  console.log(`[+] [${new Date().toISOString()}] Connecting Mineflayer Bot to ${MC_HOST}:${MC_PORT} as '${MC_USER}' (1.21.4)...`);
 
-    socket.connect(MC_PORT, MC_HOST, () => {
-      tcpActiveCount++;
-      lastPingTime = new Date().toISOString();
-      
-      // Handshake Packet (Protocol 0, Server Address, Port, Next State 1: Status)
-      const hostBuf = Buffer.from(MC_HOST, 'utf8');
-      const portBuf = Buffer.alloc(2);
-      portBuf.writeUInt16BE(MC_PORT, 0);
+  bot = mineflayer.createBot({
+    host: MC_HOST,
+    port: MC_PORT,
+    username: MC_USER,
+    version: '1.21.4',
+    checkTimeoutInterval: 60 * 1000,
+    keepAlive: true,
+  });
 
-      // Construct VarInt Length + Handshake payload
-      const handshakePayload = Buffer.concat([
-        Buffer.from([0x00]), // Packet ID 0x00 (Handshake)
-        Buffer.from([0x00]), // Protocol Version (0 for query/any)
-        Buffer.from([hostBuf.length]),
-        hostBuf,
-        portBuf,
-        Buffer.from([0x01])  // Next state: 1 (status)
-      ]);
+  bot.on('login', () => {
+    console.log(`[+] [${new Date().toISOString()}] ✅ Logged in to ${MC_HOST}:${MC_PORT}`);
+  });
 
-      const handshakePacket = Buffer.concat([
-        Buffer.from([handshakePayload.length]),
-        handshakePayload
-      ]);
+  bot.on('spawn', () => {
+    isSpawned = true;
+    lastSpawnTime = new Date().toISOString();
+    console.log(`🎉 [${new Date().toISOString()}] [SUCCESS] Bot SPAWNED into world! Position:`, bot.entity.position);
+    
+    // 随机微小移动或原地跳跃，保持活跃防 AFK
+    bot.setControlState('jump', true);
+    setTimeout(() => {
+      if (bot) bot.setControlState('jump', false);
+    }, 500);
+  });
 
-      // Status Request Packet: Length 1, Packet ID 0x00
-      const statusRequestPacket = Buffer.from([0x01, 0x00]);
+  bot.on('kicked', (reason) => {
+    isSpawned = false;
+    console.log(`[-] [${new Date().toISOString()}] Bot was kicked:`, reason);
+  });
 
-      socket.write(handshakePacket);
-      socket.write(statusRequestPacket);
-    });
+  bot.on('error', (err) => {
+    isSpawned = false;
+    console.log(`[-] [${new Date().toISOString()}] Bot error:`, err.message);
+  });
 
-    socket.on('data', (data) => {
-      lastServerStatus = 'online';
-      console.log(`[+] [${new Date().toISOString()}] TCP Keep-Alive probe active: Received ${data.length} bytes from MC server.`);
-    });
-
-    socket.on('error', (err) => {
-      console.log(`[-] [${new Date().toISOString()}] TCP probe notice: ${err.message}`);
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-    });
-
-    socket.on('close', () => {
-      // Normal close
-    });
-  }
-
-  // Send TCP Keep-Alive ping every 15 seconds to maintain active external TCP connection for host probes
-  setInterval(sendPing, 15000);
-  sendPing();
+  bot.on('end', (reason) => {
+    isSpawned = false;
+    totalReconnections++;
+    console.log(`[!] [${new Date().toISOString()}] Connection ended (${reason}). Auto-reconnecting in 10s...`);
+    setTimeout(startBot, 10000);
+  });
 }
 
-// 2. Full Player Entity Bot (Attempts full player entity login)
-let currentBot = null;
-let botReconnectTimer = null;
-
-function tryEntityBotLogin() {
-  if (botReconnectTimer) {
-    clearTimeout(botReconnectTimer);
-    botReconnectTimer = null;
-  }
-
-  try {
-    const bot = mineflayer.createBot({
-      host: MC_HOST,
-      port: MC_PORT,
-      username: MC_USER,
-      version: MC_VERSION,
-      checkTimeoutInterval: 60000,
-      hideErrors: true
-    });
-
-    currentBot = bot;
-
-    bot.on('spawn', () => {
-      console.log(`[+] [${new Date().toISOString()}] Player Entity Bot "${MC_USER}" successfully entered world!`);
-      setInterval(() => {
-        if (!bot || !bot.entity) return;
-        try {
-          bot.setControlState('jump', true);
-          setTimeout(() => {
-            if (bot && bot.setControlState) bot.setControlState('jump', false);
-          }, 300);
-        } catch (e) {}
-      }, 30000);
-    });
-
-    bot.on('end', () => {
-      currentBot = null;
-      if (!botReconnectTimer) {
-        botReconnectTimer = setTimeout(tryEntityBotLogin, 30000);
-      }
-    });
-
-    bot.on('error', () => {
-      if (!botReconnectTimer) {
-        botReconnectTimer = setTimeout(tryEntityBotLogin, 30000);
-      }
-    });
-  } catch (err) {
-    if (!botReconnectTimer) {
-      botReconnectTimer = setTimeout(tryEntityBotLogin, 30000);
-    }
-  }
-}
-
-// 3. HTTP Health Check Server (Port 8080)
+// 启动健康探活 HTTP 服务
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'ok',
-    service: 'mc-keepalive-bot',
+    service: 'mc-mineflayer-keepalive-bot',
     target: `${MC_HOST}:${MC_PORT}`,
-    server_status: lastServerStatus,
-    last_ping: lastPingTime,
-    probes_sent: tcpActiveCount,
-    entity_bot_active: !!(currentBot && currentBot.entity)
-  }, null, 2));
+    player_name: MC_USER,
+    player_spawned: isSpawned,
+    last_spawn_time: lastSpawnTime,
+    reconnections: totalReconnections,
+    bot_position: (bot && bot.entity) ? bot.entity.position : null,
+    timestamp: new Date().toISOString()
+  }));
 });
 
 server.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`=======================================================`);
-  console.log(`🚀 Minecraft 7x24 Keep-Alive Bot Started!`);
-  console.log(`🎯 Target Server : ${MC_HOST}:${MC_PORT}`);
-  console.log(`🌐 HTTP Probe    : http://0.0.0.0:${HTTP_PORT}`);
-  console.log(`=======================================================`);
+  console.log(`[+] HTTP probe server listening on port ${HTTP_PORT}`);
 });
 
-// Launch keep-alive stream & player login
-startTcpKeepAliveStream();
-tryEntityBotLogin();
+startBot();
