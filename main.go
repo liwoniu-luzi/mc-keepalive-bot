@@ -96,7 +96,7 @@ func createUncompressedPacket(packetID int, payload []byte) []byte {
 
 func createCompressedPacket(packetID int, payload []byte) []byte {
 	var body bytes.Buffer
-	writeVarInt(&body, 0) // Data length = 0 (uncompressed payload under threshold)
+	writeVarInt(&body, 0) // Data length = 0 (uncompressed)
 	writeVarInt(&body, packetID)
 	body.Write(payload)
 
@@ -123,10 +123,10 @@ func runEntityKeepAliveClient() {
 
 		// 1. Handshake (Protocol 769, Next State: 2 Login)
 		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 769) // Protocol 769
+		writeVarInt(&hsPayload, 769)
 		writeString(&hsPayload, mcHost)
 		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
-		writeVarInt(&hsPayload, 2) // Next State: 2 (Login)
+		writeVarInt(&hsPayload, 2)
 		conn.Write(createUncompressedPacket(0x00, hsPayload.Bytes()))
 
 		// 2. Login Start Packet
@@ -137,7 +137,7 @@ func runEntityKeepAliveClient() {
 		loginStart.Write(playerUUID)
 		conn.Write(createUncompressedPacket(0x00, loginStart.Bytes()))
 
-		log.Printf("[+] Sent Handshake (769 / 1.21.4) + Login Start for '%s'", mcUser)
+		log.Printf("[+] Sent Handshake + Login Start for '%s'", mcUser)
 
 		state := "login"
 		compressionEnabled := false
@@ -158,7 +158,7 @@ func runEntityKeepAliveClient() {
 			pktData := make([]byte, pktLen)
 			_, err = io.ReadFull(conn, pktData)
 			if err != nil {
-				log.Printf("[-] Failed to read packet payload: %v", err)
+				log.Printf("[-] Failed to read payload: %v", err)
 				break
 			}
 
@@ -176,7 +176,6 @@ func runEntityKeepAliveClient() {
 					packetID, _ = readVarInt(pktReader)
 					payload, _ = io.ReadAll(pktReader)
 				} else {
-					// Compressed packet - ignore decomp for huge registry packets, only extract packetID if possible
 					packetID, _ = readVarInt(pktReader)
 					payload, _ = io.ReadAll(pktReader)
 				}
@@ -202,18 +201,6 @@ func runEntityKeepAliveClient() {
 					} else {
 						conn.Write(createUncompressedPacket(0x03, nil))
 					}
-
-					// Send Client Information (en_US)
-					var ci bytes.Buffer
-					writeString(&ci, "en_US")
-					ci.WriteByte(2)     // View distance
-					writeVarInt(&ci, 0) // Chat mode
-					ci.WriteByte(1)     // Chat colors
-					ci.WriteByte(127)   // Skin parts
-					writeVarInt(&ci, 0) // Main hand
-					ci.WriteByte(0)     // Text filtering
-					ci.WriteByte(1)     // Server listing
-					conn.Write(createCompressedPacket(0x00, ci.Bytes()))
 				}
 			} else if state == "config" {
 				if packetID == 0x07 { // Known Packs
@@ -232,11 +219,10 @@ func runEntityKeepAliveClient() {
 					conn.Write(createCompressedPacket(0x04, payload))
 				}
 			} else if state == "play" {
-				// Play 状态持续回复心跳
 				if packetID == 0x40 || packetID == 0x3E { // Player position sync
 					var tc bytes.Buffer
 					writeVarInt(&tc, 0)
-					conn.Write(createCompressedPacket(0x00, tc.Bytes())) // Teleport confirm
+					conn.Write(createCompressedPacket(0x00, tc.Bytes()))
 				} else if packetID == 0x26 || len(payload) == 8 { // Keep Alive
 					conn.Write(createCompressedPacket(0x18, payload))
 				} else if packetID == 0x36 { // Ping
