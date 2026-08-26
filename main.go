@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -19,11 +18,11 @@ import (
 var (
 	mcHost         = getEnv("MC_HOST", "144.31.46.15")
 	mcPort         = getEnvInt("MC_PORT", 10486)
-	mcUser         = getEnv("MC_USER", "KeepAliveBot")
 	httpPort       = getEnv("PORT", "8080")
-	isEntityOnline = false
-	lastPingTime   = ""
+	isServerAlive  = false
+	lastProbeTime  = ""
 	probesSent     = 0
+	lastPingLatency= int64(0)
 	mu             sync.Mutex
 )
 
@@ -54,36 +53,13 @@ func writeVarInt(w io.Writer, value int) {
 	}
 }
 
-func readVarInt(r io.Reader) (int, error) {
-	var value int
-	var position uint
-	buf := make([]byte, 1)
-
-	for {
-		_, err := io.ReadFull(r, buf)
-		if err != nil {
-			return 0, err
-		}
-		b := buf[0]
-		value |= int(b&0x7F) << position
-		if (b & 0x80) == 0 {
-			break
-		}
-		position += 7
-		if position >= 32 {
-			return 0, fmt.Errorf("VarInt is too big")
-		}
-	}
-	return value, nil
-}
-
 func writeString(w io.Writer, s string) {
 	b := []byte(s)
 	writeVarInt(w, len(b))
 	w.Write(b)
 }
 
-func createUncompressedPacket(packetID int, payload []byte) []byte {
+func createPacket(packetID int, payload []byte) []byte {
 	var body bytes.Buffer
 	writeVarInt(&body, packetID)
 	body.Write(payload)
@@ -94,179 +70,90 @@ func createUncompressedPacket(packetID int, payload []byte) []byte {
 	return packet.Bytes()
 }
 
-func createCompressedPacket(packetID int, payload []byte) []byte {
-	var body bytes.Buffer
-	writeVarInt(&body, 0) // Data length = 0 (uncompressed)
-	writeVarInt(&body, packetID)
-	body.Write(payload)
+// 执行一次标准 Minecraft Status Ping 握手，重置服务端空闲计时器
+func performKeepAliveProbe() (bool, int64) {
+	start := time.Now()
+	target := fmt.Sprintf("%s:%d", mcHost, mcPort)
 
-	var packet bytes.Buffer
-	writeVarInt(&packet, body.Len())
-	packet.Write(body.Bytes())
-	return packet.Bytes()
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil {
+		return false, 0
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 1. Handshake Packet (Protocol 769, Next State: 1 Status)
+	var hsPayload bytes.Buffer
+	writeVarInt(&hsPayload, 769)
+	writeString(&hsPayload, mcHost)
+	binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
+	writeVarInt(&hsPayload, 1) // Next state: 1 (Status Query)
+	conn.Write(createPacket(0x00, hsPayload.Bytes()))
+
+	// 2. Status Request Packet
+	conn.Write(createPacket(0x00, nil))
+
+	// 3. Read Status Response
+	buf := make([]byte, 2048)
+	n, err := conn.Read(buf)
+	if err != nil || n <= 0 {
+		return false, 0
+	}
+
+	latency := time.Since(start).Milliseconds()
+	return true, latency
 }
 
-func runEntityKeepAliveClient() {
+// 7x24 定时循环探测：每 25 秒探测一次，确保空闲时间永远无法达到 60 秒阈值
+func startPeriodicKeepAliveLoop() {
+	ticker := time.NewTicker(25 * time.Second)
 	for {
-		target := fmt.Sprintf("%s:%d", mcHost, mcPort)
-		log.Printf("[+] Connecting to Minecraft 1.21.4 server as '%s' (Target: %s)...", mcUser, target)
-
-		conn, err := net.DialTimeout("tcp", target, 8*time.Second)
-		if err != nil {
-			log.Printf("[-] TCP connect error: %v. Retrying in 10s...", err)
-			mu.Lock()
-			isEntityOnline = false
-			mu.Unlock()
-			time.Sleep(10 * time.Second)
-			continue
-		}
-
-		// 1. Handshake (Protocol 769, Next State: 2 Login)
-		var hsPayload bytes.Buffer
-		writeVarInt(&hsPayload, 769)
-		writeString(&hsPayload, mcHost)
-		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
-		writeVarInt(&hsPayload, 2)
-		conn.Write(createUncompressedPacket(0x00, hsPayload.Bytes()))
-
-		// 2. Login Start Packet
-		var loginStart bytes.Buffer
-		writeString(&loginStart, mcUser)
-		playerUUID := make([]byte, 16)
-		rand.Read(playerUUID)
-		loginStart.Write(playerUUID)
-		conn.Write(createUncompressedPacket(0x00, loginStart.Bytes()))
-
-		log.Printf("[+] Sent Handshake + Login Start for '%s'", mcUser)
-
-		state := "login"
-		compressionEnabled := false
-
-		for {
-			conn.SetDeadline(time.Now().Add(45 * time.Second))
-
-			pktLen, err := readVarInt(conn)
-			if err != nil {
-				log.Printf("[-] Server connection ended: %v", err)
-				break
-			}
-
-			if pktLen <= 0 {
-				continue
-			}
-
-			pktData := make([]byte, pktLen)
-			_, err = io.ReadFull(conn, pktData)
-			if err != nil {
-				log.Printf("[-] Failed to read payload: %v", err)
-				break
-			}
-
-			pktReader := bytes.NewReader(pktData)
-
-			var packetID int
-			var payload []byte
-
-			if compressionEnabled {
-				dataLen, err := readVarInt(pktReader)
-				if err != nil {
-					continue
-				}
-				if dataLen == 0 {
-					packetID, _ = readVarInt(pktReader)
-					payload, _ = io.ReadAll(pktReader)
-				} else {
-					packetID, _ = readVarInt(pktReader)
-					payload, _ = io.ReadAll(pktReader)
-				}
-			} else {
-				packetID, _ = readVarInt(pktReader)
-				payload, _ = io.ReadAll(pktReader)
-			}
-
-			mu.Lock()
-			lastPingTime = time.Now().UTC().Format(time.RFC3339)
-			probesSent++
-			mu.Unlock()
-
-			if state == "login" {
-				if packetID == 0x03 { // Set Compression
-					compressionEnabled = true
-					log.Printf("[+] Server enabled compression")
-				} else if packetID == 0x02 { // Login Success
-					state = "config"
-					log.Printf("[+] Login Success! Sending Login Acknowledged...")
-					if compressionEnabled {
-						conn.Write(createCompressedPacket(0x03, nil))
-					} else {
-						conn.Write(createUncompressedPacket(0x03, nil))
-					}
-				}
-			} else if state == "config" {
-				if packetID == 0x07 { // Known Packs
-					var kp bytes.Buffer
-					writeVarInt(&kp, 0)
-					conn.Write(createCompressedPacket(0x07, kp.Bytes()))
-				} else if packetID == 0x03 { // Finish Configuration
-					log.Printf("[+] Received Finish Configuration from server. Entering Play state...")
-					conn.Write(createCompressedPacket(0x03, nil))
-					state = "play"
-					mu.Lock()
-					isEntityOnline = true
-					mu.Unlock()
-					log.Printf("🎉 [SUCCESS] '%s' officially joined the game (PLAY state)!", mcUser)
-				} else if packetID == 0x04 { // Ping
-					conn.Write(createCompressedPacket(0x04, payload))
-				}
-			} else if state == "play" {
-				if packetID == 0x40 || packetID == 0x3E { // Player position sync
-					var tc bytes.Buffer
-					writeVarInt(&tc, 0)
-					conn.Write(createCompressedPacket(0x00, tc.Bytes()))
-				} else if packetID == 0x26 || len(payload) == 8 { // Keep Alive
-					conn.Write(createCompressedPacket(0x18, payload))
-				} else if packetID == 0x36 { // Ping
-					conn.Write(createCompressedPacket(0x29, payload))
-				}
-			}
-		}
-
-		conn.Close()
+		ok, latency := performKeepAliveProbe()
 		mu.Lock()
-		isEntityOnline = false
+		isServerAlive = ok
+		lastProbeTime = time.Now().UTC().Format(time.RFC3339)
+		probesSent++
+		if ok {
+			lastPingLatency = latency
+			log.Printf("[+] [Keep-Alive Probe #%d] Target %s:%d active (Latency: %dms) - Server Idle Timer Reset!", probesSent, mcHost, mcPort, latency)
+		} else {
+			log.Printf("[-] [Keep-Alive Probe #%d] Target %s:%d offline/unreachable", probesSent, mcHost, mcPort)
+		}
 		mu.Unlock()
 
-		log.Printf("[!] Disconnected. Reconnecting in 10s...")
-		time.Sleep(10 * time.Second)
+		<-ticker.C
 	}
 }
 
 func main() {
 	log.Printf("=======================================================")
-	log.Printf("🚀 Ultra-Light Minecraft 1.21.4 Entity Bot on Unikraft")
+	log.Printf("🚀 Minecraft 7x24 High-Frequency Anti-Sleep KeepAlive Bot")
 	log.Printf("🎯 Target  : %s:%d", mcHost, mcPort)
-	log.Printf("👤 Player  : %s", mcUser)
+	log.Printf("⏱️ Interval: 25 Seconds (Bypasses 60s idle timeout)")
 	log.Printf("🌐 HTTP    : 0.0.0.0:%s", httpPort)
 	log.Printf("=======================================================")
 
-	go runEntityKeepAliveClient()
+	go startPeriodicKeepAliveLoop()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		mu.Lock()
-		online := isEntityOnline
-		lastPing := lastPingTime
-		sent := probesSent
+		alive := isServerAlive
+		lastTime := lastProbeTime
+		total := probesSent
+		latency := lastPingLatency
 		mu.Unlock()
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "ok",
-			"service":           "mc-entity-keepalive-bot",
+			"service":           "mc-anti-sleep-keepalive-bot",
 			"target":            fmt.Sprintf("%s:%d", mcHost, mcPort),
-			"player_name":       mcUser,
-			"player_connected":  online,
-			"last_packet_time":  lastPing,
-			"packets_exchanged": sent,
+			"interval_seconds":  25,
+			"server_alive":      alive,
+			"latency_ms":        latency,
+			"last_probe_time":   lastTime,
+			"total_probes_sent": total,
 			"timestamp":         time.Now().UTC().Format(time.RFC3339),
 		})
 	})
