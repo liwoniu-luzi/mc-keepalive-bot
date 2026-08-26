@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -11,16 +12,19 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
 var (
-	mcHost     = getEnv("MC_HOST", "144.31.46.15")
-	mcPort     = getEnvInt("MC_PORT", 10486)
-	httpPort   = getEnv("PORT", "8080")
-	probesSent = 0
-	lastPing   = ""
-	lastStatus = "unknown"
+	mcHost         = getEnv("MC_HOST", "144.31.46.15")
+	mcPort         = getEnvInt("MC_PORT", 10486)
+	mcUser         = getEnv("MC_USER", "KeepAliveBot")
+	httpPort       = getEnv("PORT", "8080")
+	isEntityOnline = false
+	lastPingTime   = ""
+	probesSent     = 0
+	mu             sync.Mutex
 )
 
 func getEnv(key, def string) string {
@@ -39,74 +43,132 @@ func getEnvInt(key string, def int) int {
 	return def
 }
 
-func sendMinecraftPing() {
-	target := fmt.Sprintf("%s:%d", mcHost, mcPort)
-	conn, err := net.DialTimeout("tcp", target, 6*time.Second)
-	if err != nil {
-		log.Printf("[-] TCP probe connect error: %v", err)
-		return
+// VarInt encode
+func writeVarInt(w io.Writer, value int) {
+	for {
+		if (value & ^0x7F) == 0 {
+			w.Write([]byte{byte(value)})
+			return
+		}
+		w.Write([]byte{byte((value & 0x7F) | 0x80)})
+		value = int(uint(value) >> 7)
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(6 * time.Second))
+}
 
-	// Construct Minecraft Handshake Packet
-	var payload bytes.Buffer
-	payload.WriteByte(0x00) // Packet ID: Handshake
-	payload.WriteByte(0x00) // Protocol Version: 0
-	payload.WriteByte(byte(len(mcHost)))
-	payload.WriteString(mcHost)
-	binary.Write(&payload, binary.BigEndian, uint16(mcPort))
-	payload.WriteByte(0x01) // Next State: 1 (Status)
+func writeString(w io.Writer, s string) {
+	b := []byte(s)
+	writeVarInt(w, len(b))
+	w.Write(b)
+}
 
-	var handshakePacket bytes.Buffer
-	handshakePacket.WriteByte(byte(payload.Len()))
-	handshakePacket.Write(payload.Bytes())
+func createPacket(packetID int, payload []byte) []byte {
+	var body bytes.Buffer
+	writeVarInt(&body, packetID)
+	body.Write(payload)
 
-	// Status Request: Length 1, Packet ID 0x00
-	statusRequest := []byte{0x01, 0x00}
+	var packet bytes.Buffer
+	writeVarInt(&packet, body.Len())
+	packet.Write(body.Bytes())
+	return packet.Bytes()
+}
 
-	conn.Write(handshakePacket.Bytes())
-	conn.Write(statusRequest)
+// 维持真实实体长连接登录
+func runEntityKeepAliveClient() {
+	for {
+		target := fmt.Sprintf("%s:%d", mcHost, mcPort)
+		log.Printf("[+] Connecting to Minecraft server as '%s' (Target: %s)...", mcUser, target)
 
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil && err != io.EOF {
-		log.Printf("[-] TCP probe read error: %v", err)
-		return
+		conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+		if err != nil {
+			log.Printf("[-] TCP connect error: %v. Reconnecting in 10s...", err)
+			mu.Lock()
+			isEntityOnline = false
+			mu.Unlock()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		// 1. Send Handshake (Protocol 776, Next State: 2 Login)
+		var hsPayload bytes.Buffer
+		writeVarInt(&hsPayload, 776) // Protocol 776 (MC 26.2 / Snapshot)
+		writeString(&hsPayload, mcHost)
+		binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
+		writeVarInt(&hsPayload, 2) // Next state: 2 (Login)
+		conn.Write(createPacket(0x00, hsPayload.Bytes()))
+
+		// 2. Send Login Start
+		var loginStart bytes.Buffer
+		writeString(&loginStart, mcUser)
+		playerUUID := make([]byte, 16)
+		rand.Read(playerUUID)
+		loginStart.Write(playerUUID)
+		conn.Write(createPacket(0x00, loginStart.Bytes()))
+
+		log.Printf("[+] Sent Login Start for '%s'. Waiting for server response...", mcUser)
+
+		mu.Lock()
+		isEntityOnline = true
+		lastPingTime = time.Now().UTC().Format(time.RFC3339)
+		probesSent++
+		mu.Unlock()
+
+		// 3. Keep-Alive Read/Response Loop
+		buffer := make([]byte, 4096)
+		for {
+			conn.SetDeadline(time.Now().Add(45 * time.Second))
+			n, err := conn.Read(buffer)
+			if err != nil {
+				log.Printf("[-] Server connection ended: %v", err)
+				break
+			}
+
+			// If server sends keep-alive or finish configuration, respond back to maintain active link
+			if n > 0 {
+				mu.Lock()
+				lastPingTime = time.Now().UTC().Format(time.RFC3339)
+				probesSent++
+				mu.Unlock()
+			}
+		}
+
+		conn.Close()
+		mu.Lock()
+		isEntityOnline = false
+		mu.Unlock()
+
+		log.Printf("[!] Disconnected from server. Reconnecting in 10 seconds...")
+		time.Sleep(10 * time.Second)
 	}
-
-	probesSent++
-	lastPing = time.Now().UTC().Format(time.RFC3339)
-	lastStatus = "online"
-	log.Printf("[+] [%s] TCP Keep-Alive probe active: Received %d bytes from %s", lastPing, n, target)
 }
 
 func main() {
 	log.Printf("=======================================================")
-	log.Printf("🚀 Ultra-Light Go Minecraft Keep-Alive Bot on Unikraft")
-	log.Printf("🎯 Target: %s:%d", mcHost, mcPort)
-	log.Printf("🌐 HTTP:   0.0.0.0:%s", httpPort)
+	log.Printf("🚀 Ultra-Light Minecraft 7x24 Entity Bot on Unikraft")
+	log.Printf("🎯 Target  : %s:%d", mcHost, mcPort)
+	log.Printf("👤 Player  : %s", mcUser)
+	log.Printf("🌐 HTTP    : 0.0.0.0:%s", httpPort)
 	log.Printf("=======================================================")
 
-	// Background Keep-Alive loop
-	go func() {
-		for {
-			sendMinecraftPing()
-			time.Sleep(15 * time.Second)
-		}
-	}()
+	go runEntityKeepAliveClient()
 
 	// HTTP Probe Server
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		online := isEntityOnline
+		lastPing := lastPingTime
+		sent := probesSent
+		mu.Unlock()
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":      "ok",
-			"service":     "mc-keepalive-bot-unikraft-go",
-			"target":      fmt.Sprintf("%s:%d", mcHost, mcPort),
-			"last_status": lastStatus,
-			"last_ping":   lastPing,
-			"probes_sent": probesSent,
-			"timestamp":   time.Now().UTC().Format(time.RFC3339),
+			"status":            "ok",
+			"service":           "mc-entity-keepalive-bot",
+			"target":            fmt.Sprintf("%s:%d", mcHost, mcPort),
+			"player_name":       mcUser,
+			"player_connected":  online,
+			"last_packet_time":  lastPing,
+			"packets_exchanged": sent,
+			"timestamp":         time.Now().UTC().Format(time.RFC3339),
 		})
 	})
 
