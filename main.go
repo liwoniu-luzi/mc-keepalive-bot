@@ -1,29 +1,27 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/Tnze/go-mc/bot"
+	"github.com/Tnze/go-mc/bot/basic"
+	_ "github.com/Tnze/go-mc/data/lang/en-us"
 )
 
 var (
-	mcHost         = getEnv("MC_HOST", "144.31.46.15")
-	mcPort         = getEnvInt("MC_PORT", 10486)
-	httpPort       = getEnv("PORT", "8080")
-	isServerAlive  = false
-	lastProbeTime  = ""
-	probesSent     = 0
-	lastPingLatency= int64(0)
-	mu             sync.Mutex
+	mcHost   = getEnv("MC_HOST", "144.31.46.15")
+	mcPort   = getEnvInt("MC_PORT", 10486)
+	mcUser   = getEnv("MC_USER", "KeepAliveBot")
+	httpPort = getEnv("PORT", "8080")
+	isOnline = false
+	mu       sync.Mutex
 )
 
 func getEnv(key, def string) string {
@@ -42,120 +40,66 @@ func getEnvInt(key string, def int) int {
 	return def
 }
 
-func writeVarInt(w io.Writer, value int) {
+func runBot() {
 	for {
-		if (value & ^0x7F) == 0 {
-			w.Write([]byte{byte(value)})
-			return
-		}
-		w.Write([]byte{byte((value & 0x7F) | 0x80)})
-		value = int(uint(value) >> 7)
-	}
-}
+		log.Printf("[+] Connecting pure Go bot to %s:%d as '%s' (Minecraft 1.21.4)...", mcHost, mcPort, mcUser)
+		client := bot.NewClient()
+		client.Auth.Name = mcUser
 
-func writeString(w io.Writer, s string) {
-	b := []byte(s)
-	writeVarInt(w, len(b))
-	w.Write(b)
-}
+		player := basic.NewPlayer(client, basic.DefaultSettings, basic.EventsListener{
+			GameStart: func() error {
+				log.Printf("🎉 [SUCCESS] '%s' officially joined the game (GameStart triggered)!", mcUser)
+				mu.Lock()
+				isOnline = true
+				mu.Unlock()
+				return nil
+			},
+			Disconnect: func(reason fmt.Stringer) error {
+				log.Printf("[-] Disconnected: %v", reason)
+				mu.Lock()
+				isOnline = false
+				mu.Unlock()
+				return nil
+			},
+		})
+		_ = player
 
-func createPacket(packetID int, payload []byte) []byte {
-	var body bytes.Buffer
-	writeVarInt(&body, packetID)
-	body.Write(payload)
-
-	var packet bytes.Buffer
-	writeVarInt(&packet, body.Len())
-	packet.Write(body.Bytes())
-	return packet.Bytes()
-}
-
-// 执行一次标准 Minecraft Status Ping 握手，重置服务端空闲计时器
-func performKeepAliveProbe() (bool, int64) {
-	start := time.Now()
-	target := fmt.Sprintf("%s:%d", mcHost, mcPort)
-
-	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil {
-		return false, 0
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// 1. Handshake Packet (Protocol 769, Next State: 1 Status)
-	var hsPayload bytes.Buffer
-	writeVarInt(&hsPayload, 769)
-	writeString(&hsPayload, mcHost)
-	binary.Write(&hsPayload, binary.BigEndian, uint16(mcPort))
-	writeVarInt(&hsPayload, 1) // Next state: 1 (Status Query)
-	conn.Write(createPacket(0x00, hsPayload.Bytes()))
-
-	// 2. Status Request Packet
-	conn.Write(createPacket(0x00, nil))
-
-	// 3. Read Status Response
-	buf := make([]byte, 2048)
-	n, err := conn.Read(buf)
-	if err != nil || n <= 0 {
-		return false, 0
-	}
-
-	latency := time.Since(start).Milliseconds()
-	return true, latency
-}
-
-// 7x24 定时循环探测：每 25 秒探测一次，确保空闲时间永远无法达到 60 秒阈值
-func startPeriodicKeepAliveLoop() {
-	ticker := time.NewTicker(25 * time.Second)
-	for {
-		ok, latency := performKeepAliveProbe()
-		mu.Lock()
-		isServerAlive = ok
-		lastProbeTime = time.Now().UTC().Format(time.RFC3339)
-		probesSent++
-		if ok {
-			lastPingLatency = latency
-			log.Printf("[+] [Keep-Alive Probe #%d] Target %s:%d active (Latency: %dms) - Server Idle Timer Reset!", probesSent, mcHost, mcPort, latency)
+		err := client.JoinServer(fmt.Sprintf("%s:%d", mcHost, mcPort))
+		if err != nil {
+			log.Printf("[-] JoinServer error: %v", err)
 		} else {
-			log.Printf("[-] [Keep-Alive Probe #%d] Target %s:%d offline/unreachable", probesSent, mcHost, mcPort)
+			if err := client.HandleGame(context.Background()); err != nil {
+				log.Printf("[-] HandleGame error: %v", err)
+			}
 		}
+
+		mu.Lock()
+		isOnline = false
 		mu.Unlock()
 
-		<-ticker.C
+		log.Printf("[!] Connection closed. Auto-reconnecting in 5 seconds...")
+		time.Sleep(5 * time.Second)
 	}
 }
 
 func main() {
 	log.Printf("=======================================================")
-	log.Printf("🚀 Minecraft 7x24 High-Frequency Anti-Sleep KeepAlive Bot")
+	log.Printf("🚀 Ultra-Light Pure Go Minecraft 1.21.4 Entity Bot")
 	log.Printf("🎯 Target  : %s:%d", mcHost, mcPort)
-	log.Printf("⏱️ Interval: 25 Seconds (Bypasses 60s idle timeout)")
+	log.Printf("👤 Player  : %s", mcUser)
 	log.Printf("🌐 HTTP    : 0.0.0.0:%s", httpPort)
 	log.Printf("=======================================================")
 
-	go startPeriodicKeepAliveLoop()
+	go runBot()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		mu.Lock()
-		alive := isServerAlive
-		lastTime := lastProbeTime
-		total := probesSent
-		latency := lastPingLatency
+		online := isOnline
 		mu.Unlock()
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "ok",
-			"service":           "mc-anti-sleep-keepalive-bot",
-			"target":            fmt.Sprintf("%s:%d", mcHost, mcPort),
-			"interval_seconds":  25,
-			"server_alive":      alive,
-			"latency_ms":        latency,
-			"last_probe_time":   lastTime,
-			"total_probes_sent": total,
-			"timestamp":         time.Now().UTC().Format(time.RFC3339),
-		})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok","service":"pure-go-mc-entity-bot","player_online":%t,"player_name":"%s","target":"%s:%d","timestamp":"%s"}`+"\n",
+			online, mcUser, mcHost, mcPort, time.Now().UTC().Format(time.RFC3339))
 	})
 
 	log.Fatal(http.ListenAndServe(":"+httpPort, nil))
