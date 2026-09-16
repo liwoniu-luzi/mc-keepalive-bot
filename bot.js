@@ -1,25 +1,49 @@
 const mineflayer = require('mineflayer');
 const http = require('http');
 
+// 拟真自然玩家 ID 池（杜绝任何 Bot、KeepAlive 等机器人特征词）
+const REALISTIC_PLAYER_NAMES = [
+  'Alex_Walker',
+  'Lucas_Miller',
+  'Arthur_Cole',
+  'Felix_Craft',
+  'Leo_Vance',
+  'Oliver_Sky',
+  'Mason_Reed',
+  'Noah_Hunter',
+  'Ethan_Cross',
+  'Liam_Brooks'
+];
+
+function getNaturalName(index) {
+  return REALISTIC_PLAYER_NAMES[index % REALISTIC_PLAYER_NAMES.length];
+}
+
 // 默认服务器保活列表（支持 Render 环境变量 SERVERS / MC_SERVERS 动态覆盖）
 function parseServerList() {
   const envServers = process.env.SERVERS || process.env.MC_SERVERS;
   if (envServers) {
     try {
-      // 尝试解析 JSON 格式
       const parsed = JSON.parse(envServers);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
+        return parsed.map((item, idx) => ({
+          id: item.id || `server_${idx + 1}`,
+          name: item.name || `Node-${idx + 1}`,
+          host: item.host,
+          port: item.port,
+          username: item.username || getNaturalName(idx),
+          version: item.version || '1.21.4'
+        }));
       }
     } catch {
-      // 尝试解析逗号分隔格式：host:port:username:version
       const list = envServers.split(',').map((item, idx) => {
         const parts = item.trim().split(':');
         return {
           id: `server_${idx + 1}`,
+          name: `Node-${idx + 1}`,
           host: parts[0] || '127.0.0.1',
           port: parseInt(parts[1] || '25565', 10),
-          username: parts[2] || `KeepAliveBot_${idx + 1}`,
+          username: parts[2] || getNaturalName(idx),
           version: parts[3] || '1.21.4',
         };
       }).filter(s => s.host);
@@ -27,14 +51,14 @@ function parseServerList() {
     }
   }
 
-  // 默认内置多服务器列表
+  // 默认内置多服务器列表（采用纯拟真玩家名）
   return [
     {
       id: 'server_1',
       name: 'Server-1 (Legacy)',
       host: process.env.MC_HOST || '144.31.46.15',
       port: parseInt(process.env.MC_PORT || '10486', 10),
-      username: process.env.MC_USER || 'KeepAliveBot_1',
+      username: process.env.MC_USER || getNaturalName(0), // Alex_Walker
       version: '1.21.4',
     },
     {
@@ -42,7 +66,7 @@ function parseServerList() {
       name: 'Server-2 (ceu.gg)',
       host: 'servidores.ceu.gg',
       port: 25905,
-      username: 'KeepAliveBot_2',
+      username: getNaturalName(1), // Lucas_Miller
       version: '1.21.4',
     }
   ];
@@ -59,7 +83,7 @@ SERVER_CONFIGS.forEach(cfg => {
     id: cfg.id,
     name: cfg.name || cfg.id,
     target: `${cfg.host}:${cfg.port}`,
-    username: cfg.username,
+    player_name: cfg.username,
     version: cfg.version,
     is_online: false,
     last_spawn_time: null,
@@ -88,7 +112,7 @@ class ServerKeepAliveWorker {
     const { id, host, port, username, version } = this.config;
     const status = runtimeStatus[id];
 
-    console.log(`[+] [${new Date().toISOString()}] [${id}] 正在连接 Minecraft 服务器 (${host}:${port}) 用户名: ${username} (版本: ${version})...`);
+    console.log(`[+] [${new Date().toISOString()}] [${id}] 正在以玩家 '${username}' 连接 Minecraft (${host}:${port}) (版本: ${version})...`);
 
     try {
       this.bot = mineflayer.createBot({
@@ -107,7 +131,7 @@ class ServerKeepAliveWorker {
     }
 
     this.bot.on('login', () => {
-      console.log(`[+] [${new Date().toISOString()}] [${id}] ✅ 登录握手成功！`);
+      console.log(`[+] [${new Date().toISOString()}] [${id}] ✅ 玩家 '${username}' 登录握手成功！`);
     });
 
     this.bot.on('spawn', () => {
@@ -117,9 +141,9 @@ class ServerKeepAliveWorker {
 
       const pos = this.bot.entity ? this.bot.entity.position : null;
       status.bot_position = pos;
-      console.log(`🎉 [${new Date().toISOString()}] [${id}] 【实体生成】玩家已进入世界！坐标:`, pos ? `X=${pos.x.toFixed(1)}, Y=${pos.y.toFixed(1)}, Z=${pos.z.toFixed(1)}` : 'N/A');
+      console.log(`🎉 [${new Date().toISOString()}] [${id}] 【实体生成】玩家 '${username}' 已进入主城世界！坐标:`, pos ? `X=${pos.x.toFixed(1)}, Y=${pos.y.toFixed(1)}, Z=${pos.z.toFixed(1)}` : 'N/A');
 
-      // 启动防 AFK 微动定时器（每 60 秒跳跃一次）
+      // 启动防 AFK 挂机检测微动定时器（每 60 秒微跳一次）
       if (this.jumpInterval) clearInterval(this.jumpInterval);
       this.jumpInterval = setInterval(() => {
         if (this.bot && status.is_online) {
@@ -145,7 +169,7 @@ class ServerKeepAliveWorker {
       status.is_online = false;
       status.bot_position = null;
       const kickMsg = typeof reason === 'object' ? JSON.stringify(reason) : String(reason);
-      console.log(`[-] [${new Date().toISOString()}] [${id}] 玩家被移出:`, kickMsg);
+      console.log(`[-] [${new Date().toISOString()}] [${id}] 玩家 '${username}' 被移出:`, kickMsg);
       status.last_error = `Kicked: ${kickMsg}`;
     });
 
@@ -164,7 +188,7 @@ class ServerKeepAliveWorker {
         clearInterval(this.jumpInterval);
         this.jumpInterval = null;
       }
-      console.log(`[!] [${new Date().toISOString()}] [${id}] 连接已断开 (${reason})。5 秒后自动重连...`);
+      console.log(`[!] [${new Date().toISOString()}] [${id}] 连接已断开 (${reason})。5 秒后自动重新进服...`);
       this.scheduleReconnect(5000);
     });
   }
@@ -205,7 +229,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: 'ok',
     service: 'render-multi-minecraft-keepalive-bot',
-    version: '1.1.0',
+    version: '1.2.0',
     summary: {
       total_servers: totalCount,
       online_servers: onlineCount,

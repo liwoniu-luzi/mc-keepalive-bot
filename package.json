@@ -1,7 +1,7 @@
 {
   "name": "mc-keepalive-bot",
-  "version": "1.1.0",
-  "description": "7x24 Multi-Server Minecraft Keep-Alive Bot for Render and Local",
+  "version": "1.2.0",
+  "description": "7x24 Multi-Server Minecraft Keep-Alive Bot with Stealth Real-Player IDs for Render and Local",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
