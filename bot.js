@@ -19,7 +19,7 @@ function getNaturalName(index) {
   return REALISTIC_PLAYER_NAMES[index % REALISTIC_PLAYER_NAMES.length];
 }
 
-// 默认服务器保活列表（支持 Render 环境变量 SERVERS / MC_SERVERS 动态覆盖）
+// 默认多服务器 & 多假人群体配置
 function parseServerList() {
   const envServers = process.env.SERVERS || process.env.MC_SERVERS;
   if (envServers) {
@@ -51,10 +51,10 @@ function parseServerList() {
     }
   }
 
-  // 默认内置多服务器列表（采用纯拟真玩家名）
+  // 默认内置多服 & 多假人群体常驻列表（双服 3 假人拟真生态）
   return [
     {
-      id: 'server_1',
+      id: 'server_1_bot_1',
       name: 'Server-1 (Legacy)',
       host: process.env.MC_HOST || '144.31.46.15',
       port: parseInt(process.env.MC_PORT || '10486', 10),
@@ -62,11 +62,19 @@ function parseServerList() {
       version: '1.21.4',
     },
     {
-      id: 'server_2',
-      name: 'Server-2 (ceu.gg)',
+      id: 'server_2_bot_1',
+      name: 'Server-2 (ceu.gg - Member 1)',
       host: 'servidores.ceu.gg',
       port: 25905,
       username: getNaturalName(1), // Lucas_Miller
+      version: '1.21.4',
+    },
+    {
+      id: 'server_2_bot_2',
+      name: 'Server-2 (ceu.gg - Member 2)',
+      host: 'servidores.ceu.gg',
+      port: 25905,
+      username: getNaturalName(2), // Arthur_Cole
       version: '1.21.4',
     }
   ];
@@ -90,6 +98,7 @@ SERVER_CONFIGS.forEach(cfg => {
     reconnect_count: 0,
     last_error: null,
     bot_position: null,
+    last_action: null,
   };
 });
 
@@ -99,7 +108,7 @@ class ServerKeepAliveWorker {
     this.bot = null;
     this.isDestroyed = false;
     this.reconnectTimer = null;
-    this.jumpInterval = null;
+    this.actionInterval = null;
   }
 
   start() {
@@ -143,26 +152,9 @@ class ServerKeepAliveWorker {
       status.bot_position = pos;
       console.log(`🎉 [${new Date().toISOString()}] [${id}] 【实体生成】玩家 '${username}' 已进入主城世界！坐标:`, pos ? `X=${pos.x.toFixed(1)}, Y=${pos.y.toFixed(1)}, Z=${pos.z.toFixed(1)}` : 'N/A');
 
-      // 启动防 AFK 挂机检测微动定时器（每 60 秒微跳一次）
-      if (this.jumpInterval) clearInterval(this.jumpInterval);
-      this.jumpInterval = setInterval(() => {
-        if (this.bot && status.is_online) {
-          try {
-            this.bot.setControlState('jump', true);
-            setTimeout(() => {
-              if (this.bot) this.bot.setControlState('jump', false);
-            }, 350);
-          } catch (_) {}
-        }
-      }, 60 * 1000);
-
-      // 进服首次微动
-      try {
-        this.bot.setControlState('jump', true);
-        setTimeout(() => {
-          if (this.bot) this.bot.setControlState('jump', false);
-        }, 400);
-      } catch (_) {}
+      // 启动拟真自然生态行为循环（每 20 ~ 40 秒随机执行拟真操作）
+      if (this.actionInterval) clearInterval(this.actionInterval);
+      this.scheduleNextRealisticAction();
     });
 
     this.bot.on('kicked', (reason) => {
@@ -184,13 +176,79 @@ class ServerKeepAliveWorker {
       status.is_online = false;
       status.bot_position = null;
       status.reconnect_count++;
-      if (this.jumpInterval) {
-        clearInterval(this.jumpInterval);
-        this.jumpInterval = null;
+      if (this.actionInterval) {
+        clearTimeout(this.actionInterval);
+        this.actionInterval = null;
       }
       console.log(`[!] [${new Date().toISOString()}] [${id}] 连接已断开 (${reason})。5 秒后自动重新进服...`);
       this.scheduleReconnect(5000);
     });
+  }
+
+  // 拟真玩家随机行为模拟器（转头环顾、微小移动、挥手打拳、潜行下蹲、跳跃等）
+  scheduleNextRealisticAction() {
+    if (!this.bot || !runtimeStatus[this.config.id].is_online) return;
+
+    const delay = Math.floor(Math.random() * 20000) + 20000; // 20s ~ 40s 随机间隔
+    this.actionInterval = setTimeout(() => {
+      this.performRealisticAction();
+      this.scheduleNextRealisticAction();
+    }, delay);
+  }
+
+  performRealisticAction() {
+    const { id, username } = this.config;
+    const status = runtimeStatus[id];
+    if (!this.bot || !status.is_online) return;
+
+    try {
+      const actionType = Math.floor(Math.random() * 5);
+      switch (actionType) {
+        case 0: { // 随机转头视角环顾
+          const randomYaw = (Math.random() * 2 - 1) * Math.PI;
+          const randomPitch = (Math.random() * 0.8 - 0.4);
+          this.bot.look(randomYaw, randomPitch, true).catch(() => {});
+          status.last_action = `LookAround (Yaw: ${randomYaw.toFixed(2)}, Pitch: ${randomPitch.toFixed(2)})`;
+          break;
+        }
+        case 1: { // 挥动主手
+          this.bot.swingArm('right');
+          status.last_action = 'SwingArm';
+          break;
+        }
+        case 2: { // 微小跳跃
+          this.bot.setControlState('jump', true);
+          setTimeout(() => {
+            if (this.bot) this.bot.setControlState('jump', false);
+          }, 350);
+          status.last_action = 'Jump';
+          break;
+        }
+        case 3: { // 拟真下蹲潜行（Shift）
+          this.bot.setControlState('sneak', true);
+          setTimeout(() => {
+            if (this.bot) this.bot.setControlState('sneak', false);
+          }, 800);
+          status.last_action = 'Sneak';
+          break;
+        }
+        case 4: { // 微步调整站位
+          const moveDir = Math.random() > 0.5 ? 'forward' : 'back';
+          this.bot.setControlState(moveDir, true);
+          setTimeout(() => {
+            if (this.bot) this.bot.setControlState(moveDir, false);
+          }, 300);
+          status.last_action = `MicroMove (${moveDir})`;
+          break;
+        }
+      }
+
+      if (this.bot.entity && this.bot.entity.position) {
+        status.bot_position = this.bot.entity.position;
+      }
+    } catch (e) {
+      // 忽略微小动作异常
+    }
   }
 
   scheduleReconnect(delayMs) {
@@ -229,12 +287,12 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: 'ok',
     service: 'render-multi-minecraft-keepalive-bot',
-    version: '1.2.0',
+    version: '1.3.0',
     summary: {
-      total_servers: totalCount,
-      online_servers: onlineCount,
+      total_bots: totalCount,
+      online_bots: onlineCount,
     },
-    servers: serversList,
+    bots: serversList,
     timestamp: new Date().toISOString()
   }, null, 2));
 });
