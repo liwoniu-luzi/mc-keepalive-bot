@@ -51,7 +51,7 @@ function parseServerList() {
     }
   }
 
-  // 默认内置多服 & 多假人群体常驻列表（双服 3 假人拟真生态）
+  // 默认内置服务器常驻列表
   return [
     {
       id: 'server_1_bot_1',
@@ -59,22 +59,6 @@ function parseServerList() {
       host: process.env.MC_HOST || '144.31.46.15',
       port: parseInt(process.env.MC_PORT || '10486', 10),
       username: process.env.MC_USER || getNaturalName(0), // Alex_Walker
-      version: '1.21.4',
-    },
-    {
-      id: 'server_2_bot_1',
-      name: 'Server-2 (ceu.gg - Member 1)',
-      host: 'servidores.ceu.gg',
-      port: 25905,
-      username: getNaturalName(1), // Lucas_Miller
-      version: '1.21.4',
-    },
-    {
-      id: 'server_2_bot_2',
-      name: 'Server-2 (ceu.gg - Member 2)',
-      host: 'servidores.ceu.gg',
-      port: 25905,
-      username: getNaturalName(2), // Arthur_Cole
       version: '1.21.4',
     }
   ];
@@ -287,7 +271,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: 'ok',
     service: 'render-multi-minecraft-keepalive-bot',
-    version: '1.3.0',
+    version: '1.4.0',
     summary: {
       total_bots: totalCount,
       online_bots: onlineCount,
