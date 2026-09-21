@@ -51,7 +51,7 @@ function parseServerList() {
     }
   }
 
-  // 默认内置服务器常驻列表
+  // 默认内置服务器常驻列表（双服拟真生态）
   return [
     {
       id: 'server_1_bot_1',
